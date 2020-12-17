@@ -1,0 +1,397 @@
+Slice Silac preprocessing
+========================================================
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#options(scipen=500)
+suppressPackageStartupMessages(library("ggplot2"))
+suppressPackageStartupMessages(library("kableExtra"))
+suppressPackageStartupMessages(library(stringr))
+
+#slices.used.for.shift <- c(21:47)
+```
+
+### Remove contaminants
+
+Proteins annotated by MaxQuant as contaminants and reverse sequences are excluded. Additionally proteins containing one of the following expressions in the protein names are excluded:
+
+*   Keratin
+*   Desmo
+*   Plako
+*   Filaggrin
+*   Corneao
+*   Derm
+*   Cystatin
+*   Horn
+*   TGM1
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+inputFileName <- "proteinGroups.txt"
+outputFileName <- "output_scaled.txt"
+outputFittingFunction <- "outputFittingFunction.RData"
+all.tags <- c()
+
+## open input file and load all data
+dataMQ <- read.table(inputFileName, stringsAsFactors=FALSE,quote="\"", row.names=NULL,
+                     header=TRUE, sep="\t", fill=TRUE, na.strings=c("Non Num\303\251rique"))
+
+
+# remove columns containing this tag
+if(exists("ignore.tag")){
+  dataMQ <- dataMQ[,-grep(ignore.tag, colnames(dataMQ))]
+}
+
+# remove tag from colnames
+for(one.tag in all.tags){
+  colnames(dataMQ) <- gsub(one.tag, "", colnames(dataMQ))  
+}
+
+# remove contaminants identified by their names
+contaminant.term <- c("keratin", "desmo", "plako", "filaggrin", "corneao", "derm", "cystatin", "horn", "annexin")
+contaminant.ac <- c("Q9NZT1", "P31944", "P04264")
+contaminant.id <- grep( paste("^", contaminant.term, sep="", collapse="|"), dataMQ[, "Fasta.headers"], ignore.case = TRUE)
+contaminant.id <- c(contaminant.id, grep( paste(contaminant.ac, sep="", collapse="|"), dataMQ[, "Protein.IDs"]))
+
+# remove given gene names
+contaminant.genes <- c("TGM1")
+contaminant.id <- c(contaminant.id, grep( paste("^", contaminant.genes, sep="", collapse="|"), dataMQ[, "Fasta.headers"], ignore.case = TRUE))
+contaminant.id <- unique(contaminant.id)
+
+# prepare table to plot
+contaminants.removed <- dataMQ[contaminant.id, c("Protein.IDs", "Fasta.headers", "Potential.contaminant", "Ratio.H.L")]
+contaminants.removed$Protein.IDs <- unlist(lapply(contaminants.removed$Protein.IDs, function(x) head(unlist(strsplit(x, ";")) , n=1)))
+
+# remove also contaminants and reverse indicated by MaxQuant
+contaminant.id <- c(contaminant.id, which(dataMQ$Only.identified.by.site == "+"))
+contaminant.id <- c(contaminant.id, which(dataMQ$Reverse == "+"))
+contaminant.id <- c(contaminant.id, which(dataMQ$Potential.contaminant == "+"))
+
+contaminant.id <- unique(contaminant.id)
+dataMQ <- dataMQ[-contaminant.id, ]
+
+```
+
+#### Contaminants removed because of their names
+
+```{r,results='asis', echo=FALSE}
+#table <- gvisTable(contaminants.removed, options=list(width=1200, height=450))
+#print(table, tag="chart")
+contaminants.removed %>%
+  kable() %>%
+  kable_styling(c("striped", "condensed"), full_width = FALSE)
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+# get the columns of interest
+data.colnames <- colnames(dataMQ)
+countColumns <- grep("Ratio.H.L.count\\.[0-9]?\\.?\\w+", data.colnames)
+band.names <- sub("Ratio.H.L.count.", "", data.colnames[countColumns])
+ratioColumns <- which(data.colnames %in% paste0("Ratio.H.L.", band.names))
+
+# get the rigth slice numbering
+slices_list <- unlist(lapply(colnames(dataMQ[,ratioColumns]), function(x) sprintf("%02d",as.numeric(str_extract(x, "([0-9]+)$")))))
+slices_number <- length(slices_list)
+
+## keep only high expressed
+isAbove10 <- apply(dataMQ[, ratioColumns ], 
+                   MARGIN=1, 
+#                   FUN=function(x) {return(any(as.numeric(x)>10, na.rm=TRUE))})
+                   FUN=function(x) {return(FALSE)})
+
+dataMQ <- dataMQ[!isAbove10, ]
+
+## Order by theoretical molecular weight
+molWeightColumn <- "Mol..weight..kDa."
+protOrderByWeight <- order(as.numeric(dataMQ[, molWeightColumn]), decreasing=TRUE)
+
+sortedDataMQ <- dataMQ[protOrderByWeight, countColumns]
+sortedMolWeight <- as.numeric(dataMQ[protOrderByWeight, molWeightColumn])
+sortedRatios <- dataMQ[protOrderByWeight, ratioColumns]
+
+## Boxplot for all band
+whichDetected <- (sortedDataMQ > 4)
+allWeightsByBand <- data.frame(matrix(rep(sortedMolWeight, times=slices_number), ncol=slices_number))
+allWeightsByBand[!whichDetected] <- NA
+names(allWeightsByBand) <- slices_list
+
+stackedMolWeight <- stack(allWeightsByBand)
+stackedMSMSCount <- stack(sortedDataMQ)
+stackedRatios <- stack(sortedRatios)
+
+orderByMSMSCount <- order(stackedMSMSCount$values, decreasing=FALSE)
+sortedStackedMolWeight <- stackedMolWeight[orderByMSMSCount,]
+sortedStackedMSMSCount <- stackedMSMSCount[orderByMSMSCount,]
+sortedStackedRatios <- stackedRatios[orderByMSMSCount,]
+
+sortedStackedRatios$ind <- sortedStackedMolWeight$ind
+colnames(sortedRatios) <- slices_list
+
+
+# prepare ticks for log2 scale:
+log.ticks <- c(12.5)
+end.tick <- 800
+
+do.ticks <- function(x){
+  last.x <- x[length(x)]
+  if(last.x < end.tick) x <- Recall(c(x, last.x*2))
+  x
+}
+
+log.ticks <- do.ticks(log.ticks)
+```
+
+### Protein intensitiy plot
+
+This plot shows the intensities of the proteins (H/L ratios count).
+The x-axis represents the corresponding slices, the y-axis the theoretical molecular weight of the protein identification.
+Only proteins with an MSMS count > 4 are shown.
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+# the plot
+qplot(x=ind, y=values, data=sortedStackedMolWeight, na.rm=TRUE, geom=c("jitter"), 
+      colour=log2(sortedStackedMSMSCount$values), 
+      xlab="Slice", ylab="Theoretical molecular weight (log2)") + 
+    scale_colour_gradientn(colours=c("yellow", "red"), name="H/L ratios count (log2)") + 
+    scale_y_continuous(breaks=log.ticks) + 
+    coord_trans(y = "log2") 
+```
+
+### Protein ratio plot
+
+This plot shows the H/L ratios.
+The x-axis represents again the corresponding slices, the y-axis the theoretical molecular weight of the protein identification.
+Only proteins with an MSMS count > 4 are shown.
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+qplot(x=ind, y=values, data=sortedStackedMolWeight, na.rm=TRUE, geom=c("jitter"), 
+      colour=log2(sortedStackedRatios[,"values"]), 
+      xlab="Slice", ylab="Theoretical molecular weight (log2)") + 
+    scale_colour_gradient(low="green", high="red", name="H/L ratios (log2)", limits=c(-5.5,5.5)) +
+    scale_y_continuous(breaks=log.ticks) + 
+    coord_trans(y = "log2")
+```
+
+```{r, echo=FALSE, warning=FALSE}
+
+# select either normalized or raw data ("Ratio.H.L.normalized.")
+#interesting_colnames_ratios <- grep("Ratio.H.L\\.[0-9]*\\.", colnames(dataMQ)) 
+interesting_colnames_ratios <- ratioColumns # grep("Ratio.H.L\\.normalized\\..+", colnames(dataMQ)) 
+my.ratios <- dataMQ[, interesting_colnames_ratios]
+colnames(my.ratios) <- slices_list
+my.stacked.ratios <- stack(my.ratios)
+
+# plot median of raw ratios
+medianRawRatios <- apply(log2(my.ratios), 2, function(x) median(x, na.rm=TRUE))
+names(medianRawRatios) <- slices_list
+
+# zero median normalization
+zero.median.norm <- apply(log2(my.ratios), 2, function(x) x-median(x, na.rm=TRUE))
+
+# mean between slices 6 - 38
+#median.correction <- round(mean(medianRawRatios[slices.used.for.shift]), digits=2)
+
+# correct slice 4 and 37 according to their neighbours
+#neighbour.correction <- median(unlist(log2(my.ratios)[c(3,5)]), na.rm=TRUE)
+#zero.median.norm[,4] <- unlist(log2(my.ratios)[4] - neighbour.correction)
+
+# the limits for the boxplots:
+bp.lower.lim <- log2(min(my.ratios, na.rm=TRUE)) - 0.5
+bp.upper.lim <- log2(max(my.ratios, na.rm=TRUE)) + 0.5
+bp.limits <- c(bp.lower.lim, bp.upper.lim)
+
+```
+
+### Normalization
+
+Non normalized data *(Ratio.H.L)* from the MaxQuant results were taken. We normalize the those data using a zero median normalization.
+
+#### Boxplot before zero median normalization
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+## Not norm + log2
+ggplot(my.stacked.ratios, aes(x=ind, y=log2(values)), na.rm=TRUE) + 
+  geom_boxplot() +
+  xlab("Slice") +
+  ylab("H/L ratios (log2)") +
+  ylim(bp.limits)
+
+# ## MaxQuant normalization + log2
+# interesting_colnames_ratios_MQnorm <- paste("Ratio.H.L.normalized.", slices_list, sep="") 
+# stackedDataMQNorm <- stack(log2(dataMQ[!isAbove10, interesting_colnames_ratios_MQnorm]))
+# boxplot(values ~ind, data=stackedDataMQNorm, names=slices_list, main="MaxQuant normalization (log2)")
+# 
+# 
+# ## not norm + 0.25
+# interesting_colnames_ratios_MQnorm <- paste("Ratio.H.L.normalized.", slices_list, sep="") 
+# stackedDataMQNorm <- stack(log2(dataMQ[!isAbove10, interesting_colnames_ratios_MQnorm]))
+# boxplot(values ~ind, data=stackedDataMQNorm, names=slices_list, main="MaxQuant normalization (log2)")
+
+```
+
+
+#### Boxplot after zero median normalization
+
+All Slices were shifted to zero median.
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+ my.normRatios.log <- data.frame(zero.median.norm)
+ colnames(my.normRatios.log) <- slices_list
+
+ ggplot(stack(my.normRatios.log), aes(x=ind, y=values), na.rm=TRUE) + 
+  geom_boxplot() +
+  xlab("Slice") +
+  ylab("H/L ratios (log2)") +
+  ylim(bp.limits) 
+
+```
+
+
+```{r, echo=FALSE}
+
+colnames(my.normRatios.log) <- paste0("Ratio.H.L.PAF.normalized.", colnames(my.normRatios.log))
+final.dataMQ <- cbind(dataMQ, my.normRatios.log)
+
+write.table(x=final.dataMQ, file=outputFileName, sep="\t", na='', quote=FALSE, row.names=FALSE)
+
+#colnames(head(dataMQ))
+
+# in case we want the MQ normalized and median-shifter ratios:
+#data.for.results <- scaledVals
+
+# in case we want the MQ normalized ratios:
+# data.for.results <- log2(dataMQ[!isAbove10, interesting_colnames_ratios_MQnorm])
+
+# in case we want the raw ratios (with a median shift of + 0.08):
+# data.for.results <- log2(dataMQ[!isAbove10, interesting_colnames_ratios]) + 0.08 
+# colnames(data.for.results) <- colnames(scaledVals)
+# 
+# ## Write table
+# write.table(x=cbind(dataMQ[!isAbove10, !(names(dataMQ) %in% paste("Ratio.H.L.PAF.normalized.", slices_list, sep=""))], 
+#                     data.for.results), 
+#             file=outputFileName, sep="\t", na='', quote=FALSE, row.names=FALSE)
+
+```
+
+
+### Fit slices to masses
+
+##### Plot data before filtering:
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+# use the functions from preprocessDataFunctions.R
+source("preprocessDataFunctions.R")
+library(reshape2)
+
+# load data
+dataMQList <- list()
+
+dataMQList[["data"]] <- dataMQ
+my.filename <- gsub(".txt", "", inputFileName)
+dataMQList[["filename"]] <- my.filename
+dataMQList[["slices_number"]] <- slices_number
+
+# remove contaminants from data
+dataMQList <- remove_MQ_contaminants(dataMQList)
+
+# extract intensities (add "intensities" and "masses")
+#ignore.slices <- c(1)
+#dataMQList <- get_intensity_and_mass_columns(dataMQList, ignore.slices)
+dataMQList <- get_intensity_and_mass_columns(dataMQList)
+
+# keep the mass min/max for comparable plotting
+my.ylim <- c(min(log10(dataMQList$masses)), max(log10(dataMQList$masses)))
+
+# plot original data before filtering
+p <- plot_original_data(dataMQList) + scale_y_continuous(limits=my.ylim)
+print(p)
+
+```
+
+
+##### Remove points with H/L counts below 4:
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+dataMQList <- filter_by_H.L.count(dataMQList, 4)
+
+p <- plot_original_data(dataMQList) + scale_y_continuous(limits=my.ylim)
+print(p)
+```
+
+##### After removing proteins which are present on more than 30% of the slices (probably contaminants):
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+# filter entries which are repeated in to many slices. They are probably also contaminants.
+dataMQList <- filter_repeated_entries(dataMQList, totPercThreshold=0.2)
+
+# plot original data after filtering
+p <- plot_original_data(dataMQList) + scale_y_continuous(limits=my.ylim)
+print(p)
+
+```
+
+##### Remove regions with only very few proteins (< 5) and fit this data using a polynomial function:
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+# keep only regions with many points
+dataMQList <- filter_low_densities(dataMQList, minNrThreshold=5)
+
+# plot data
+#p <- plot_original_data(dataMQList) + scale_y_continuous(limits=my.ylim)
+#print(p)
+
+# fit slices to log10(theoretical_masses)
+my.fitting.function <- get_fitting_function(dataMQList)
+predicted_masses <- predict_slice_masses(dataMQList, my.fitting.function)
+
+save(my.fitting.function, predicted_masses, file=outputFittingFunction)
+
+p <- plot_fit_data(dataMQList, my.fitting.function)
+print(p)
+
+```
+
+##### Quality of matching and a plot showing the final fit:
+
+```{r, echo=FALSE, warning=FALSE, fig.width=14}
+
+#print(my.fitting.function)
+summary(my.fitting.function)
+
+predicted_masses.flat <- 10^predicted_masses
+predicted_masses.stacked <- stack(predicted_masses.flat)
+predicted_masses.stacked$ind = 1:(length(slices_list)) #as.factor(slices_list)
+
+p <- qplot(x=ind, y=values, data=sortedStackedMolWeight, na.rm=TRUE, geom=c("jitter"), 
+    colour=log2(sortedStackedMSMSCount$values), 
+    xlab="Slice", ylab="Theoretical molecular weight (log2)") + 
+    scale_colour_gradientn(colours=c("yellow", "red"), name="H/L ratios count (log2)") + 
+    scale_y_continuous(breaks=log.ticks) + 
+    coord_trans(y = "log2")+
+    geom_line(data=predicted_masses.stacked, aes(x=ind, y=values), colour="red", group="polynomial fit", size=1.5)
+
+print(p)
+
+
+my.c <- coef(my.fitting.function)
+
+```
+
+##### Polynomial function used for fitting (x: slice_number, f(x): theoretical MW in log10 ):
+
+f(x) = `r sprintf("%e", my.c[1])` + `r sprintf("%e", my.c[2])` * x  + `r sprintf("%e", my.c[3])` * x^2 + `r sprintf("%e", my.c[4])` * x^3 
+
+##### Predicted MW's for all the slices
+```{r,results='asis', echo=FALSE}
+predicted_masses.table <- data.frame(slice=names(predicted_masses), theoMW=10^predicted_masses)
+predicted_masses.table %>%
+  kable() %>%
+  kable_styling(c("striped", "condensed"), full_width = FALSE)
+#table <- gvisTable(predicted_masses.table)#, options=list(width=1200, height=450))
+#print(table, tag="chart")
+```
